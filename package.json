@@ -4,7 +4,6 @@
   "description": "Explains your code line by line with AI. Hover over any word to understand it. Press Enter after a line to see an inline explanation.",
   "version": "0.1.0",
   "publisher": "code-liner",
-  "icon": "images/icon.png",
   "engines": {
     "vscode": "^1.85.0"
   },
