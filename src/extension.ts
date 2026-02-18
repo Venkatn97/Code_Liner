@@ -489,13 +489,26 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!config.get<boolean>('showInlineExplanations')) return;
 
       for (const change of event.contentChanges) {
-        // A newline was inserted → user pressed Enter
-        if (change.text.includes('\n')) {
-          const lineNum = change.range.start.line;
-          // Process asynchronously so typing isn't blocked
-          processLine(event.document, lineNum).catch(() => {
-            // silently swallow; error shown in decoration
-          });
+        if (!change.text.includes('\n')) continue;
+
+        const startLine = change.range.start.line;
+        const newlineCount = (change.text.match(/\n/g) || []).length;
+
+        // Distinguish Enter key (only whitespace inserted) from paste (has real content)
+        const isPaste = change.text.replace(/\s/g, '').length > 0;
+
+        if (isPaste) {
+          // Process every pasted line; cap at 20 to avoid flooding the API
+          const linesToProcess = Math.min(newlineCount + 1, 20);
+          for (let i = 0; i < linesToProcess; i++) {
+            const lineNum = startLine + i;
+            if (lineNum < event.document.lineCount) {
+              processLine(event.document, lineNum).catch(() => {});
+            }
+          }
+        } else {
+          // Plain Enter key — explain the line that was just completed
+          processLine(event.document, startLine).catch(() => {});
         }
       }
     })
