@@ -348,6 +348,13 @@ async function processLine(
   // Skip blank lines and very short ones (e.g. lone braces)
   if (!trimmed || trimmed.length < 2) return;
 
+  // Skip pure comment lines — the comment itself is the explanation
+  // Covers: # (Python/bash), // (JS/TS/C), /* and */ (block comments), * (inside block comments)
+  if (/^(#|\/\/|\/\*|\*\/|\*\s)/.test(trimmed)) return;
+
+  // Skip lines that are only closing delimiters (e.g. `};`, `})`, `]),`)
+  if (/^[\}\]\);,]+$/.test(trimmed)) return;
+
   const editor = vscode.window.activeTextEditor;
   if (editor && editor.document.uri.toString() === document.uri.toString()) {
     setLoadingDecoration(editor, lineNum);
@@ -429,6 +436,14 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.workspace.onDidChangeTextDocument(async (event) => {
       const config = vscode.workspace.getConfiguration('codeLiner');
       if (!config.get<boolean>('enabled')) return;
+
+      // Always re-apply decorations after any document change (e.g. save with
+      // trailing-whitespace trimming or format-on-save) so they never disappear.
+      const activeEditor = vscode.window.activeTextEditor;
+      if (activeEditor && activeEditor.document.uri.toString() === event.document.uri.toString()) {
+        refreshDecorations(activeEditor);
+      }
+
       if (config.get<string>('inlineExplanationTrigger') !== 'onEnter') return;
       if (!config.get<boolean>('showInlineExplanations')) return;
 
