@@ -17,6 +17,12 @@ let inlineDecoration: vscode.TextEditorDecorationType;
 // Panel for the side-by-side explanation view
 let explanationPanel: vscode.WebviewPanel | undefined;
 
+// Debounce timer for the hover provider (avoids firing on every mouse movement)
+let hoverDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+
+// In-flight API requests: cacheKey → Promise  (avoids duplicate concurrent calls)
+const inFlightRequests = new Map<string, Promise<string>>();
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function getClient(): Anthropic | null {
@@ -84,6 +90,11 @@ async function explainLine(
     return explanationCache.get(cacheKey)!;
   }
 
+  // Return the existing in-flight promise if one is already running for this key
+  if (inFlightRequests.has(cacheKey)) {
+    return inFlightRequests.get(cacheKey)!;
+  }
+
   const anthropic = getClient();
   if (!anthropic) {
     return '⚠️ Add your API key: Settings → Code Liner → Api Key';
@@ -108,20 +119,27 @@ Rules:
 - Do NOT repeat the code itself.
 - Reply with only the explanation, nothing else.`;
 
-  try {
-    const response = await anthropic.messages.create({
+  const request = anthropic.messages
+    .create({
       model: getModel(),
       max_tokens: 150,
       messages: [{ role: 'user', content: prompt }],
+    })
+    .then((response) => {
+      const text = (response.content[0] as { type: string; text: string }).text.trim();
+      explanationCache.set(cacheKey, text);
+      return text;
+    })
+    .catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      return `⚠️ ${message}`;
+    })
+    .finally(() => {
+      inFlightRequests.delete(cacheKey);
     });
 
-    const text = (response.content[0] as { type: string; text: string }).text.trim();
-    explanationCache.set(cacheKey, text);
-    return text;
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    return `⚠️ ${message}`;
-  }
+  inFlightRequests.set(cacheKey, request);
+  return request;
 }
 
 /**
@@ -136,6 +154,11 @@ async function explainWord(
   const cacheKey = `word::${language}::${word}::${fullLine}`;
   if (explanationCache.has(cacheKey)) {
     return explanationCache.get(cacheKey)!;
+  }
+
+  // Return the existing in-flight promise if one is already running for this key
+  if (inFlightRequests.has(cacheKey)) {
+    return inFlightRequests.get(cacheKey)!;
   }
 
   const anthropic = getClient();
@@ -158,30 +181,39 @@ Rules:
 - Use simple words. No jargon unless you define it.
 - Reply with only the explanation. No markdown headers.`;
 
-  try {
-    const response = await anthropic.messages.create({
+  const request = anthropic.messages
+    .create({
       model: getModel(),
       max_tokens: 200,
       messages: [{ role: 'user', content: prompt }],
+    })
+    .then((response) => {
+      const text = (response.content[0] as { type: string; text: string }).text.trim();
+      explanationCache.set(cacheKey, text);
+      return text;
+    })
+    .catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      return `⚠️ ${message}`;
+    })
+    .finally(() => {
+      inFlightRequests.delete(cacheKey);
     });
 
-    const text = (response.content[0] as { type: string; text: string }).text.trim();
-    explanationCache.set(cacheKey, text);
-    return text;
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    return `⚠️ ${message}`;
-  }
+  inFlightRequests.set(cacheKey, request);
+  return request;
 }
 
 // ─── Decorations (inline ghost text) ─────────────────────────────────────────
 
 /**
  * Refresh the inline ghost-text decorations for a given editor.
+ * Skips the work entirely when there are no explanations for the file.
  */
 function refreshDecorations(editor: vscode.TextEditor): void {
   const uri = editor.document.uri.toString();
   const map = documentExplanations.get(uri);
+  // Fast-path: nothing to render, clear and bail out
   if (!map || map.size === 0) {
     editor.setDecorations(inlineDecoration, []);
     return;
@@ -398,34 +430,43 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   // ── Hover Provider ───────────────────────────────────────────────────────────
-  // Shows a tooltip when you hover over any word
+  // Shows a tooltip when you hover over any word.
+  // Uses a 500 ms debounce so the API is only called when the user actually
+  // pauses on a word, not on every mouse movement.
   context.subscriptions.push(
     vscode.languages.registerHoverProvider('*', {
-      async provideHover(
+      provideHover(
         document: vscode.TextDocument,
         position: vscode.Position
       ): Promise<vscode.Hover | undefined> {
         const config = vscode.workspace.getConfiguration('codeLiner');
-        if (!config.get<boolean>('enabled')) return undefined;
+        if (!config.get<boolean>('enabled')) return Promise.resolve(undefined);
 
         const wordRange = document.getWordRangeAtPosition(position);
-        if (!wordRange) return undefined;
+        if (!wordRange) return Promise.resolve(undefined);
 
         const word = document.getText(wordRange);
-        if (!word || word.length < 2) return undefined;
+        if (!word || word.length < 2) return Promise.resolve(undefined);
 
-        const fullLine = document.lineAt(position.line).text.trim();
-        const language = getLanguage(document);
+        // Cancel any previous pending hover request
+        if (hoverDebounceTimer !== undefined) {
+          clearTimeout(hoverDebounceTimer);
+        }
 
-        const explanation = await explainWord(word, fullLine, language);
-
-        const md = new vscode.MarkdownString(
-          `**Code Liner** — \`${word}\`\n\n${explanation}`
-        );
-        md.isTrusted = true;
-        md.supportHtml = false;
-
-        return new vscode.Hover(md, wordRange);
+        return new Promise<vscode.Hover | undefined>((resolve) => {
+          hoverDebounceTimer = setTimeout(async () => {
+            hoverDebounceTimer = undefined;
+            const fullLine = document.lineAt(position.line).text.trim();
+            const language = getLanguage(document);
+            const explanation = await explainWord(word, fullLine, language);
+            const md = new vscode.MarkdownString(
+              `**Code Liner** — \`${word}\`\n\n${explanation}`
+            );
+            md.isTrusted = true;
+            md.supportHtml = false;
+            resolve(new vscode.Hover(md, wordRange));
+          }, 500);
+        });
       },
     })
   );
@@ -587,8 +628,12 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export function deactivate(): void {
+  if (hoverDebounceTimer !== undefined) {
+    clearTimeout(hoverDebounceTimer);
+  }
   client = null;
   explanationCache.clear();
+  inFlightRequests.clear();
   documentExplanations.clear();
   explanationPanel = undefined;
 }
