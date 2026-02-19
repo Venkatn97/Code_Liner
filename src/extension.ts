@@ -552,10 +552,47 @@ export function activate(context: vscode.ExtensionContext): void {
       const config = vscode.workspace.getConfiguration('codeLiner');
       if (!config.get<boolean>('enabled')) return;
 
+      const uri = event.document.uri.toString();
+
+      // When lines are inserted or deleted, shift the stored explanations so
+      // they continue to match the correct line numbers.
+      const existingMap = documentExplanations.get(uri);
+      if (existingMap && existingMap.size > 0) {
+        // Process changes from bottom to top to avoid offset conflicts
+        const sortedChanges = [...event.contentChanges].sort(
+          (a, b) => b.range.start.line - a.range.start.line
+        );
+
+        let updatedMap = new Map(existingMap);
+        for (const change of sortedChanges) {
+          const startLine = change.range.start.line;
+          const endLine = change.range.end.line;
+          const removedLines = endLine - startLine;
+          const addedLines = (change.text.match(/\n/g) || []).length;
+          const lineDelta = addedLines - removedLines;
+
+          if (lineDelta !== 0) {
+            const newMap = new Map<number, string>();
+            for (const [lineNum, explanation] of updatedMap) {
+              if (lineNum < startLine) {
+                // Lines before the change: keep as-is
+                newMap.set(lineNum, explanation);
+              } else if (lineNum > endLine) {
+                // Lines after the change: shift by the delta
+                newMap.set(lineNum + lineDelta, explanation);
+              }
+              // Lines within the changed range are invalidated — drop them
+            }
+            updatedMap = newMap;
+          }
+        }
+        documentExplanations.set(uri, updatedMap);
+      }
+
       // Always re-apply decorations after any document change (e.g. save with
       // trailing-whitespace trimming or format-on-save) so they never disappear.
       const activeEditor = vscode.window.activeTextEditor;
-      if (activeEditor && activeEditor.document.uri.toString() === event.document.uri.toString()) {
+      if (activeEditor && activeEditor.document.uri.toString() === uri) {
         refreshDecorations(activeEditor);
       }
 
