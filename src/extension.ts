@@ -4,6 +4,7 @@ import Anthropic from '@anthropic-ai/sdk';
 // ─── State ────────────────────────────────────────────────────────────────────
 
 let client: Anthropic | null = null;
+let grokApiKeyCache: string = '';
 
 // Cache: code string → explanation  (avoids calling API for same code twice)
 const explanationCache = new Map<string, string>();
@@ -43,6 +44,15 @@ function getClient(): Anthropic | null {
 
 function resetClient(): void {
   client = null;
+  grokApiKeyCache = '';
+}
+
+function getProvider(): string {
+  return (
+    vscode.workspace
+      .getConfiguration('codeLiner')
+      .get<string>('provider') || 'anthropic'
+  );
 }
 
 function getModel(): string {
@@ -51,6 +61,58 @@ function getModel(): string {
       .getConfiguration('codeLiner')
       .get<string>('model') || 'claude-haiku-4-5-20251001'
   );
+}
+
+function getGrokModel(): string {
+  return (
+    vscode.workspace
+      .getConfiguration('codeLiner')
+      .get<string>('grokModel') || 'grok-4-fast-non-reasoning'
+  );
+}
+
+function getGrokApiKey(): string {
+  if (grokApiKeyCache) return grokApiKeyCache;
+  const config = vscode.workspace.getConfiguration('codeLiner');
+  const key =
+    config.get<string>('grokApiKey')?.trim() ||
+    process.env.GROK_API_KEY ||
+    '';
+  grokApiKeyCache = key;
+  return key;
+}
+
+/**
+ * Call xAI's OpenAI-compatible Grok API.
+ */
+async function callGrokAPI(prompt: string, maxTokens: number): Promise<string> {
+  const apiKey = getGrokApiKey();
+  if (!apiKey) {
+    return '⚠️ Add your Grok API key: Settings → Code Liner → Grok Api Key';
+  }
+
+  const response = await fetch('https://api.x.ai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: getGrokModel(),
+      max_tokens: maxTokens,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => response.statusText);
+    throw new Error(`Grok API ${response.status}: ${errorText}`);
+  }
+
+  const data = (await response.json()) as {
+    choices: Array<{ message: { content: string } }>;
+  };
+  return data.choices[0].message.content.trim();
 }
 
 /**
@@ -95,11 +157,6 @@ async function explainLine(
     return inFlightRequests.get(cacheKey)!;
   }
 
-  const anthropic = getClient();
-  if (!anthropic) {
-    return '⚠️ Add your API key: Settings → Code Liner → Api Key';
-  }
-
   const prompt = `You are a friendly coding tutor explaining code to a beginner.
 
 Language: ${language}
@@ -119,24 +176,32 @@ Rules:
 - Do NOT repeat the code itself.
 - Reply with only the explanation, nothing else.`;
 
-  const request = anthropic.messages
-    .create({
-      model: getModel(),
-      max_tokens: 150,
-      messages: [{ role: 'user', content: prompt }],
-    })
-    .then((response) => {
-      const text = (response.content[0] as { type: string; text: string }).text.trim();
+  const request = (async (): Promise<string> => {
+    try {
+      let text: string;
+      if (getProvider() === 'grok') {
+        text = await callGrokAPI(prompt, 150);
+      } else {
+        const anthropic = getClient();
+        if (!anthropic) {
+          return '⚠️ Add your API key: Settings → Code Liner → Api Key';
+        }
+        const response = await anthropic.messages.create({
+          model: getModel(),
+          max_tokens: 150,
+          messages: [{ role: 'user', content: prompt }],
+        });
+        text = (response.content[0] as { type: string; text: string }).text.trim();
+      }
       explanationCache.set(cacheKey, text);
       return text;
-    })
-    .catch((err: unknown) => {
+    } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       return `⚠️ ${message}`;
-    })
-    .finally(() => {
+    } finally {
       inFlightRequests.delete(cacheKey);
-    });
+    }
+  })();
 
   inFlightRequests.set(cacheKey, request);
   return request;
@@ -161,11 +226,6 @@ async function explainWord(
     return inFlightRequests.get(cacheKey)!;
   }
 
-  const anthropic = getClient();
-  if (!anthropic) {
-    return '⚠️ Add your API key: Settings → Code Liner → Api Key';
-  }
-
   const prompt = `You are a friendly coding tutor explaining code to a beginner.
 
 Language: ${language}
@@ -181,24 +241,32 @@ Rules:
 - Use simple words. No jargon unless you define it.
 - Reply with only the explanation. No markdown headers.`;
 
-  const request = anthropic.messages
-    .create({
-      model: getModel(),
-      max_tokens: 200,
-      messages: [{ role: 'user', content: prompt }],
-    })
-    .then((response) => {
-      const text = (response.content[0] as { type: string; text: string }).text.trim();
+  const request = (async (): Promise<string> => {
+    try {
+      let text: string;
+      if (getProvider() === 'grok') {
+        text = await callGrokAPI(prompt, 200);
+      } else {
+        const anthropic = getClient();
+        if (!anthropic) {
+          return '⚠️ Add your API key: Settings → Code Liner → Api Key';
+        }
+        const response = await anthropic.messages.create({
+          model: getModel(),
+          max_tokens: 200,
+          messages: [{ role: 'user', content: prompt }],
+        });
+        text = (response.content[0] as { type: string; text: string }).text.trim();
+      }
       explanationCache.set(cacheKey, text);
       return text;
-    })
-    .catch((err: unknown) => {
+    } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       return `⚠️ ${message}`;
-    })
-    .finally(() => {
+    } finally {
       inFlightRequests.delete(cacheKey);
-    });
+    }
+  })();
 
   inFlightRequests.set(cacheKey, request);
   return request;
@@ -422,7 +490,13 @@ export function activate(context: vscode.ExtensionContext): void {
   // Invalidate client when settings change
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('codeLiner.apiKey') || e.affectsConfiguration('codeLiner.model')) {
+      if (
+        e.affectsConfiguration('codeLiner.apiKey') ||
+        e.affectsConfiguration('codeLiner.model') ||
+        e.affectsConfiguration('codeLiner.provider') ||
+        e.affectsConfiguration('codeLiner.grokApiKey') ||
+        e.affectsConfiguration('codeLiner.grokModel')
+      ) {
         resetClient();
         explanationCache.clear();
       }
